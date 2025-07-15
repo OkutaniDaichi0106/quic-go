@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"math"
 	"net"
-	"os"
+	"runtime"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -59,25 +61,6 @@ func (h *mockPacketHandler) destroy(err error) {
 }
 
 func (h *mockPacketHandler) closeWithTransportError(code qerr.TransportErrorCode) {}
-
-func getPacket(t *testing.T, connID protocol.ConnectionID) []byte {
-	return getPacketWithPacketType(t, connID, protocol.PacketTypeHandshake, 2)
-}
-
-func getPacketWithPacketType(t *testing.T, connID protocol.ConnectionID, typ protocol.PacketType, length protocol.ByteCount) []byte {
-	t.Helper()
-	b, err := (&wire.ExtendedHeader{
-		Header: wire.Header{
-			Type:             typ,
-			DestConnectionID: connID,
-			Length:           length,
-			Version:          protocol.Version1,
-		},
-		PacketNumberLen: protocol.PacketNumberLen2,
-	}).Append(nil, protocol.Version1)
-	require.NoError(t, err)
-	return append(b, bytes.Repeat([]byte{42}, int(length)-2)...)
-}
 
 func TestTransportPacketHandling(t *testing.T) {
 	tr := &Transport{Conn: newUDPConnLocalhost(t)}
@@ -480,20 +463,20 @@ func testTransportDial(t *testing.T, early bool) {
 	originalClientConnConstructor := newClientConnection
 	t.Cleanup(func() { newClientConnection = originalClientConnConstructor })
 
-	mockCtrl := gomock.NewController(t)
-	conn := NewMockQUICConn(mockCtrl)
+	var conn *connTestHooks
 	handshakeChan := make(chan struct{})
-	if early {
-		conn.EXPECT().earlyConnReady().Return(handshakeChan)
-		conn.EXPECT().HandshakeComplete().Return(make(chan struct{}))
-	} else {
-		conn.EXPECT().HandshakeComplete().Return(handshakeChan)
-	}
 	blockRun := make(chan struct{})
-	conn.EXPECT().run().DoAndReturn(func() error {
-		<-blockRun
-		return errors.New("done")
-	})
+	if early {
+		conn = &connTestHooks{
+			earlyConnReady:    func() <-chan struct{} { return handshakeChan },
+			handshakeComplete: func() <-chan struct{} { return make(chan struct{}) },
+		}
+	} else {
+		conn = &connTestHooks{
+			handshakeComplete: func() <-chan struct{} { return handshakeChan },
+		}
+	}
+	conn.run = func() error { <-blockRun; return errors.New("done") }
 	defer close(blockRun)
 
 	newClientConnection = func(
@@ -512,8 +495,8 @@ func testTransportDial(t *testing.T, early bool) {
 		_ *logging.ConnectionTracer,
 		_ utils.Logger,
 		_ protocol.Version,
-	) quicConn {
-		return conn
+	) *wrappedConn {
+		return &wrappedConn{testHooks: conn}
 	}
 
 	tr := &Transport{Conn: newUDPConnLocalhost(t)}
@@ -543,25 +526,20 @@ func testTransportDial(t *testing.T, early bool) {
 		require.NoError(t, err)
 	case <-time.After(time.Second):
 	}
-
-	// for test tear-down
-	conn.EXPECT().destroy(gomock.Any()).AnyTimes()
 }
 
 func TestTransportDialingVersionNegotiation(t *testing.T) {
 	originalClientConnConstructor := newClientConnection
 	t.Cleanup(func() { newClientConnection = originalClientConnConstructor })
 
-	// connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8})
-	mockCtrl := gomock.NewController(t)
-	// runner := NewMockConnRunner(mockCtrl)
-	conn := NewMockQUICConn(mockCtrl)
-	conn.EXPECT().HandshakeComplete().Return(make(chan struct{}))
-	conn.EXPECT().run().Return(&errCloseForRecreating{nextPacketNumber: 109, nextVersion: 789})
-
-	conn2 := NewMockQUICConn(mockCtrl)
-	conn2.EXPECT().HandshakeComplete().Return(make(chan struct{}))
-	conn2.EXPECT().run().Return(assert.AnError)
+	conn := &connTestHooks{
+		handshakeComplete: func() <-chan struct{} { return make(chan struct{}) },
+		run:               func() error { return &errCloseForRecreating{nextPacketNumber: 109, nextVersion: 789} },
+	}
+	conn2 := &connTestHooks{
+		handshakeComplete: func() <-chan struct{} { return make(chan struct{}) },
+		run:               func() error { return assert.AnError },
+	}
 
 	type connParams struct {
 		pn                   protocol.PacketNumber
@@ -587,13 +565,13 @@ func TestTransportDialingVersionNegotiation(t *testing.T) {
 		_ *logging.ConnectionTracer,
 		_ utils.Logger,
 		v protocol.Version,
-	) quicConn {
+	) *wrappedConn {
 		connChan <- connParams{pn: pn, hasNegotiatedVersion: hasNegotiatedVersion, version: v}
 		if counter == 0 {
 			counter++
-			return conn
+			return &wrappedConn{testHooks: conn}
 		}
-		return conn2
+		return &wrappedConn{testHooks: conn2}
 	}
 
 	tr := &Transport{Conn: newUDPConnLocalhost(t)}
@@ -619,13 +597,11 @@ func TestTransportDialingVersionNegotiation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 	}
-
-	// for test tear down
-	conn.EXPECT().destroy(gomock.Any()).AnyTimes()
-	conn2.EXPECT().destroy(gomock.Any()).AnyTimes()
 }
 
 func TestTransportReplaceWithClosed(t *testing.T) {
+	t.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
+
 	t.Run("local", func(t *testing.T) {
 		testTransportReplaceWithClosed(t, true)
 	})
@@ -644,7 +620,7 @@ func testTransportReplaceWithClosed(t *testing.T, local bool) {
 	tr.init(true)
 	defer tr.Close()
 
-	dur := scaleDuration(10 * time.Millisecond)
+	dur := scaleDuration(20 * time.Millisecond)
 
 	var closePacket []byte
 	if local {
@@ -655,7 +631,6 @@ func testTransportReplaceWithClosed(t *testing.T, local bool) {
 	connID := protocol.ParseConnectionID([]byte{4, 3, 2, 1})
 	m := (*packetHandlerMap)(tr)
 	require.True(t, m.Add(connID, handler))
-	start := time.Now()
 	m.ReplaceWithClosed([]protocol.ConnectionID{connID}, closePacket, dur)
 
 	p := make([]byte, 100)
@@ -663,39 +638,64 @@ func testTransportReplaceWithClosed(t *testing.T, local bool) {
 	copy(p[1:], connID.Bytes())
 
 	conn := newUDPConnLocalhost(t)
-	var sent int
-	for now := range time.NewTicker(dur / 20).C {
-		_, err := conn.WriteTo(p, tr.Conn.LocalAddr())
-		require.NoError(t, err)
-		sent++
-		if now.After(start.Add(dur)) {
-			break
+	var sent atomic.Int64
+	errChan := make(chan error, 1)
+	stopSending := make(chan struct{})
+	go func() {
+		defer close(errChan)
+		ticker := time.NewTicker(dur / 50)
+		timeout := time.NewTimer(scaleDuration(time.Second))
+		for {
+			select {
+			case <-stopSending:
+				return
+			case <-timeout.C:
+				errChan <- errors.New("timeout")
+				return
+			case <-ticker.C:
+			}
+			if _, err := conn.WriteTo(p, tr.Conn.LocalAddr()); err != nil {
+				errChan <- err
+				return
+			}
+			sent.Add(1)
 		}
-	}
+	}()
+
 	// For locally closed connections, CONNECTION_CLOSE packets are sent with an exponential backoff
-	for i := 0; i*i < sent; i++ {
-		conn.SetReadDeadline(time.Now().Add(time.Second))
-		b := make([]byte, 100)
-		if local {
-			n, _, err := conn.ReadFrom(b)
-			require.NoError(t, err)
-			require.Equal(t, []byte("foobar"), b[:n])
-		}
-	}
-	// Afterwards, we receive a stateless reset, not a copy of the CONNECTION_CLOSE packet.
-	// Retry up to 3 times, the connection is deleted from the map on a timer.
-	for i := 0; i < 3; i++ {
-		_, err := conn.WriteTo(p, tr.Conn.LocalAddr())
-		require.NoError(t, err)
-		conn.SetReadDeadline(time.Now().Add(dur / 4))
+	var received int
+	conn.SetReadDeadline(time.Now().Add(scaleDuration(time.Second)))
+	for {
 		b := make([]byte, 100)
 		n, _, err := conn.ReadFrom(b)
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			continue
-		}
 		require.NoError(t, err)
-		require.NotEqual(t, []byte("foobar"), b[:n])
-		require.GreaterOrEqual(t, n, protocol.MinStatelessResetSize)
-		break
+		// at some point, the connection is cleaned up, and we'll receive a stateless reset
+		if !bytes.Equal(b[:n], []byte("foobar")) {
+			require.GreaterOrEqual(t, n, protocol.MinStatelessResetSize)
+			close(stopSending) // stop sending packets
+			break
+		}
+		received++
 	}
+
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	numSent := sent.Load()
+	if !local {
+		require.Zero(t, received)
+		t.Logf("sent %d packets", numSent)
+		return
+	}
+	t.Logf("sent %d packets, received %d CONNECTION_CLOSE copies", numSent, received)
+	// timer resolution on Windows is terrible
+	if runtime.GOOS != "windows" {
+		require.GreaterOrEqual(t, numSent, int64(8))
+	}
+	require.GreaterOrEqual(t, received, int(math.Floor(math.Log2(float64(numSent)))))
+	require.LessOrEqual(t, received, int(math.Ceil(math.Log2(float64(numSent)))))
 }

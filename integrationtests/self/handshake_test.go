@@ -280,7 +280,7 @@ func TestClosedConnectionsInAcceptQueue(t *testing.T) {
 	time.Sleep(scaleDuration(25 * time.Millisecond)) // wait for connections to be queued and closed
 
 	// accept all connections, and find the closed one
-	var closedConn quic.Connection
+	var closedConn *quic.Conn
 	for i := 0; i < 2; i++ {
 		conn, err := server.Accept(ctx)
 		require.NoError(t, err)
@@ -426,6 +426,8 @@ func testHandshakeCloseListener(t *testing.T, createListener func(*tls.Config) *
 	conn, err := quic.Dial(ctx, newUDPConnLocalhost(t), ln.Addr(), getTLSClientConfig(), getQuicConfig(nil))
 	require.NoError(t, err)
 	defer conn.CloseWithError(0, "")
+	_, err = ln.Accept(ctx)
+	require.NoError(t, err)
 
 	errChan := make(chan error, 1)
 	go func() {
@@ -465,7 +467,7 @@ func TestALPN(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
-	acceptChan := make(chan quic.Connection, 2)
+	acceptChan := make(chan *quic.Conn, 2)
 	go func() {
 		for {
 			conn, err := ln.Accept(context.Background())
@@ -742,4 +744,70 @@ func TestNoPacketsSentWhenClientHelloFails(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 		// no packets received, as expected
 	}
+}
+
+func TestServerTransportClose(t *testing.T) {
+	tlsServerConf := getTLSConfig()
+	tr := &quic.Transport{Conn: newUDPConnLocalhost(t)}
+	server, err := tr.Listen(tlsServerConf, getQuicConfig(nil))
+	require.NoError(t, err)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	// the first conn is accepted by the server...
+	conn1, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{MaxIdleTimeout: scaleDuration(50 * time.Millisecond)}),
+	)
+	require.NoError(t, err)
+	// ...the second conn isn't, it remains in the server's accept queue
+	conn2, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{MaxIdleTimeout: scaleDuration(50 * time.Millisecond)}),
+	)
+	require.NoError(t, err)
+
+	time.Sleep(scaleDuration(10 * time.Millisecond))
+
+	sconn, err := server.Accept(ctx)
+	require.NoError(t, err)
+	require.Equal(t, conn1.LocalAddr(), sconn.RemoteAddr())
+
+	// closing the Transport abruptly terminates connections
+	require.NoError(t, tr.Close())
+
+	select {
+	case <-sconn.Context().Done():
+		require.ErrorIs(t, context.Cause(sconn.Context()), quic.ErrTransportClosed)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	// no CONNECTION_CLOSE frame is sent to the peers
+	select {
+	case <-conn1.Context().Done():
+		require.ErrorIs(t, context.Cause(conn1.Context()), &quic.IdleTimeoutError{})
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+	select {
+	case <-conn2.Context().Done():
+		require.ErrorIs(t, context.Cause(conn1.Context()), &quic.IdleTimeoutError{})
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	// Accept should error after the transport was closed
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	accepted, err := server.Accept(ctx)
+	require.ErrorIs(t, err, quic.ErrTransportClosed)
+	require.Nil(t, accepted)
 }
