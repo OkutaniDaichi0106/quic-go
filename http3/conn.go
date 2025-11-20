@@ -121,6 +121,10 @@ func (c *Conn) ConnectionState() quic.ConnectionState {
 	return c.conn.ConnectionState()
 }
 
+func (c *Conn) ConnectionStats() quic.ConnectionStats {
+	return c.conn.ConnectionStats()
+}
+
 func (c *Conn) onIdleTimer() {
 	c.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "idle timeout")
 }
